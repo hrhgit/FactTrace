@@ -121,7 +121,9 @@ GAP_FILL_PARTS = '''This long conversation was read part by part. "facts" lists 
 gives each flagged paragraph with its neighbours.'''
 
 GAP_FILL_RETRY = '''"rejected" gives the program's reason for each flagged paragraph your previous answer did not settle; the other
-paragraphs are saved. Settle these flagged paragraphs now.'''
+paragraphs are saved. When present, "diagnostics" gives the exact JSON path, actual value, expected value and source paragraph
+for the failed item. Use those diagnostics to revise the response; do not guess a semantic replacement. Settle these flagged
+paragraphs now.'''
 
 
 QUESTION_FLAGS = '''Decide how a person's memory records should be gathered to answer the question. Do NOT answer it.

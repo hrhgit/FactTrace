@@ -148,7 +148,8 @@ class MixedMemoryTests(unittest.TestCase):
             self.write_set(root / "set", {"alice": ["Alice bought a red brush."]})
             out = root / "run"
             self.assertEqual(self.run_command("write", "--set", str(root / "set"), "--output", str(out)), 0)
-            with patch.object(run_mixed_memory, "SEARCH_RETRY_DELAY", 0):
+            with patch.object(run_mixed_memory, "SEARCH_RETRY_DELAY", 0), \
+                 patch("text_memory.collections.question_flags.ERROR_DELAYS", (0, 0)):
                 # The first judgment fails, the repeated search succeeds.
                 self.purposes, self.flag_failures = [], 1
                 self.assertEqual(self.run_command("search", "--set", str(root / "set"), "--output", str(out)), 0)
@@ -157,13 +158,31 @@ class MixedMemoryTests(unittest.TestCase):
                 self.assertEqual((len(saved["calls"]), saved["question_flags_error"]), (4, None))
                 self.assertTrue((out / "search-top16/contexts.jsonl").exists())
                 # Every repeat fails: the run fails and writes no new contexts.
-                (out / "search-top16/contexts.jsonl").unlink()
                 self.purposes, self.flag_failures = [], run_mixed_memory.SEARCH_ATTEMPTS
                 self.assertEqual(self.run_command("search", "--set", str(root / "set"), "--output", str(out)), 1)
                 self.assertEqual(len(self.purposes), 3 * run_mixed_memory.SEARCH_ATTEMPTS)
                 self.assertFalse((out / "search-top16/contexts.jsonl").exists())
                 failures = json.loads((out / "search-top16/search-failures.json").read_text())
                 self.assertIn("invalid reply", failures["alice#q"])
+                self.assertFalse((out / "search-top16/search-stats.json").exists())
+                self.flag_failures = 0
+                self.assertEqual(self.run_command("search", "--set", str(root / "set"), "--output", str(out)), 0)
+                self.assertTrue((out / "search-top16/contexts.jsonl").exists())
+                self.assertFalse((out / "search-top16/search-failures.json").exists())
+
+    def test_search_logs_program_errors_without_repeating_model_work(self):
+        self.purposes = []
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self.write_set(root / "set", {"alice": ["Alice bought a red brush."]})
+            out = root / "run"
+            self.assertEqual(self.run_command("write", "--set", str(root / "set"), "--output", str(out)), 0)
+            with patch.object(run_mixed_memory.CollectionApplication, "search", side_effect=ValueError("local defect")) as search:
+                self.assertEqual(self.run_command("search", "--set", str(root / "set"), "--output", str(out)), 1)
+            self.assertEqual(search.call_count, 1)
+            self.assertFalse((out / "search-top16/contexts.jsonl").exists())
+            failures = json.loads((out / "search-top16/search-failures.json").read_text())
+            self.assertEqual(failures["alice#q"], "ValueError: local defect")
 
     def test_question_without_history_gets_empty_material(self):
         self.purposes = []

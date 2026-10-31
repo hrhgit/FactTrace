@@ -81,10 +81,13 @@ class ChannelUsageTests(unittest.TestCase):
         model = self.model(pool, lambda _: httpx.Response(200, json={"usage": USAGE, "choices": []}))
         with self.assertRaises(ModelError):
             self.ask(model)
-        self.assertEqual(pool.snapshot()["channels"][0]["usage"]["total_tokens"], 120)
+        for channel in pool.snapshot()["channels"]:
+            self.assertEqual(channel["usage"]["total_tokens"], 360)
+            self.assertEqual((channel["usage"]["requests"], channel["usage"]["errors"]), (3, 3))
+            self.assertEqual(channel["usage"]["unfinished_requests"], 0)
         self.ask(self.model(pool, lambda _: reply(None)))
         usage = pool.snapshot()["channels"][0]["usage"]
-        self.assertEqual((usage["total_tokens"], usage["unmeasured_requests"], usage["unpriced_requests"]), (120, 1, 1))
+        self.assertEqual((usage["total_tokens"], usage["unmeasured_requests"], usage["unpriced_requests"]), (360, 1, 1))
         self.assertIsNone(normalize_usage({"total_tokens": -1})["total_tokens"])
         self.assertIsNone(normalize_usage({"prompt_tokens": True})["prompt_tokens"])
         self.assertEqual(normalize_usage({"input_tokens": 6, "output_tokens": 4})["total_tokens"], 10)

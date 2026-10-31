@@ -15,7 +15,7 @@ FORMAL_SCRIPT_FILES = (
     'prepare_personamem.py', 'record_sources.py', 'restore_data.py',
     'run_mixed_answers.py', 'run_mixed_memory.py', 'sample_eval_sets.py',
 )
-SOURCE_FILES = ('README.md', 'AGENTS.md', '.env.example', '.gitignore', '.python-version',
+SOURCE_FILES = ('README.md', 'AGENTS.md', 'LICENSE', '.env.example', '.gitignore', '.python-version',
                 'requirements.txt', 'requirements.lock.txt', 'pytest.ini',
                 'data/source-revisions.json', 'data/official-source.json')
 

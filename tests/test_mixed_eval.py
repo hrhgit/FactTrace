@@ -4,7 +4,11 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+import httpx
+
 from scripts import run_mixed_answers
+from text_memory.errors import ModelError
+from text_memory.evaluation import TimedModel
 from text_memory.mixed_eval import answer_messages, grade, pipeline
 from text_memory.model import ModelConfig
 from tests.fixtures import ScriptedModel
@@ -65,10 +69,54 @@ class GradeTests(unittest.TestCase):
         self.assertEqual(judge.calls[1]["messages"][0]["content"], pipeline("beam").EQUIVALENCE_SYSTEM_PROMPT)
 
     def test_invalid_judge_output_raises_instead_of_scoring_zero(self):
-        with self.assertRaises(ValueError):
-            grade(TASKS["beam"], "Q", {"question_type": "x", "rubric": ["a"]}, "A", ScriptedModel("not json"))
-        with self.assertRaises(ValueError):
-            grade(TASKS["clbench"], "Q", {"rubrics": ["r"]}, "A", ScriptedModel("not json"))
+        for dataset, label in (("beam", {"question_type": "x", "rubric": ["a"]}),
+                               ("clbench", {"rubrics": ["r"]})):
+            with self.subTest(dataset=dataset):
+                judge = ScriptedModel("not json 1", "not json 2", "not json 3")
+                with self.assertRaisesRegex(ModelError, "judge.*3 次输出尝试"):
+                    grade(TASKS[dataset], "Q", label, "A", judge)
+                self.assertEqual(len(judge.calls), 3)
+                self.assertFalse(judge.calls[-1]["output_validation"]["retry_scheduled"])
+
+    def test_bad_judgments_receive_feedback_and_can_recover(self):
+        score = '{"scores":[{"index":0,"score":1,"reason":"correct"}]}'
+        clbench = '{"Overall Score":1,"List of Requirement Satisfaction Status":["yes"]}'
+        cases = [
+            ("locomo-refined", {"gold_answer": "a"}, '{"label":"maybe"}', '{"label":"CORRECT"}'),
+            ("longmemeval", {"gold_answer": "a"}, "not json", '{"label":"CORRECT"}'),
+            ("beam", {"question_type": "x", "rubric": ["a"]}, '{"scores":[]}', score),
+            ("clbench", {"rubrics": ["r"]}, '{"Overall Score":"unknown"}', clbench),
+            ("clbench", {"rubrics": ["r"]}, '{"Overall Score":0}', clbench),
+            ("clbench", {"rubrics": ["r"]}, '{"Overall Score":1,"List of Requirement Satisfaction Status":["maybe"]}', clbench),
+        ]
+        for dataset, label, bad, good in cases:
+            with self.subTest(dataset=dataset, bad=bad):
+                judge = ScriptedModel(bad, good)
+                self.assertEqual(grade(TASKS[dataset], "Q", label, "A", judge)["score"], 1.0)
+                self.assertEqual(len(judge.calls), 2)
+                first, second = [call["messages"] for call in judge.calls]
+                self.assertEqual(second[:-2], first)
+                self.assertEqual(second[-2], {"role": "assistant", "content": bad})
+                self.assertIn("tool_error", json.loads(second[-1]["content"]))
+                self.assertTrue(judge.calls[0]["output_validation"]["retry_scheduled"])
+
+    def test_event_alignment_does_not_silently_treat_bad_output_as_no(self):
+        scores = '{"scores":[{"index":0,"score":1,"reason":"ok"}]}'
+        label = {"question_type": "event_ordering", "rubric": ["event"]}
+        judge = ScriptedModel(scores, "unclear", "YES")
+        result = grade(TASKS["beam"], "Q", label, "answer", judge)
+        self.assertEqual(result["event_ordering"], pipeline("beam").event_ordering_metrics(["event"], ["event"]))
+        self.assertEqual(len(judge.calls), 3)
+        self.assertIn("YES 或 NO", judge.calls[1]["output_validation"]["message"])
+        with self.assertRaises(ModelError):
+            grade(TASKS["beam"], "Q", label, "answer", ScriptedModel(scores, "unclear", "unclear"))
+
+    def test_judge_program_errors_are_not_retried(self):
+        judge = ScriptedModel('{"scores":[]}')
+        with patch.object(pipeline("beam"), "parse_rubric_scores", side_effect=TypeError("local defect")):
+            with self.assertRaisesRegex(TypeError, "local defect"):
+                grade(TASKS["beam"], "Q", {"question_type": "x", "rubric": ["a"]}, "A", judge)
+        self.assertEqual(len(judge.calls), 1)
 
     def test_clbench_is_all_or_nothing_and_empty_answers_skip_the_judge(self):
         payload = {"Grading Rationale": "missed one", "List of Requirement Satisfaction Status": ["yes", "no"], "Overall Score": 0}
@@ -120,6 +168,55 @@ class RunnerTests(unittest.TestCase):
             self.assertEqual((summary["subset"]["inside"]["questions"], summary["subset"]["inside"]["micro_score"]), (1, 1.0))
             self.assertEqual(summary["subset"]["outside"]["micro_score"], 0.5)
             self.assertIn("labels_sha256", json.loads((out / "manifest.json").read_text())["judge"])
+
+    def test_failed_answers_and_grades_keep_traces_without_creating_results_and_resume(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self.write_set(root / "set", ["x:1"])
+            (root / "set/inputs/tasks.jsonl").write_text(json.dumps({"id": "x:1", **TASKS["beam"]}) + "\n")
+            (root / "set/scoring/labels.jsonl").write_text(json.dumps(
+                {"id": "x:1", "question_type": "information_extraction", "rubric": ["answer"]}) + "\n")
+            (root / "contexts.jsonl").write_text('{"id":"x:1","context":"C"}\n')
+            out = root / "run"
+            config = ModelConfig("https://test.invalid", "test-key", "test-model")
+            state = {"response": "  ", "count": 0}
+
+            def handler(request):
+                state["count"] += 1
+                content = (f"bad-{state['count']}" if state["response"] == "bad" else state["response"])
+                return httpx.Response(200, json={"usage": {"total_tokens": 3}, "choices": [
+                    {"finish_reason": "stop", "message": {"content": content}}]})
+
+            def main(*argv):
+                with patch("sys.argv", ["run", *argv]):
+                    return run_mixed_answers.main()
+
+            transport = httpx.MockTransport(handler)
+            with patch.object(run_mixed_answers.ModelConfig, "from_env", return_value=config), \
+                 patch.object(run_mixed_answers, "TimedModel", side_effect=lambda c, channel_pool=None: TimedModel(
+                     c, channel_pool=channel_pool, transport=transport, sleep=lambda _: None)), \
+                 patch.object(run_mixed_answers, "print", create=True):
+                args = ("answer", "--set", str(root / "set"), "--contexts", str(root / "contexts.jsonl"),
+                        "--output", str(out), "--workers", "1")
+                self.assertEqual(main(*args), 1)
+                self.assertFalse((out / "answers/x_1.json").exists())
+                trace = json.loads((out / "traces/answer-x_1.json").read_text())
+                self.assertEqual(len(trace["calls"]), 3)
+                self.assertTrue(all(c["status"] == "invalid_output" for c in trace["calls"]))
+                state["response"] = "answer"
+                self.assertEqual(main(*args), 0)
+                self.assertEqual(json.loads((out / "answers/x_1.json").read_text())["generated_answer"], "answer")
+                state["response"] = "bad"
+                self.assertEqual(main("grade", "--output", str(out)), 1)
+                self.assertFalse((out / "grades/x_1.json").exists())
+                trace = json.loads((out / "traces/grade-x_1.json").read_text())
+                self.assertEqual(len(trace["calls"]), 3)
+                self.assertTrue(all("output_validation" in c for c in trace["calls"]))
+                state["response"] = '{"scores":[{"index":0,"score":1,"reason":"ok"}]}'
+                self.assertEqual(main("grade", "--output", str(out)), 0)
+                self.assertEqual(json.loads((out / "grades/x_1.json").read_text())["score"], 1.0)
+                errors = [json.loads(line) for line in (out / "errors.jsonl").read_text().splitlines()]
+                self.assertEqual([error["phase"] for error in errors], ["answer", "grade"])
 
 
 if __name__ == "__main__":

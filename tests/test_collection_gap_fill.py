@@ -89,6 +89,26 @@ class GapFillTests(unittest.TestCase):
         disguised = {"no_fact": [{"ref": "m1.1", "reason": "already recorded in fact 0"}]}
         self.assertIn("理由称内容已保存", gap_fill.apply_fill(loose, disguised, gaps, aliases, texts)[1]["m1.1"])
 
+    def test_no_fact_reason_can_use_ordinary_word_covered(self):
+        aliases = {"m0.1": "source"}
+        texts = {"m0.1": "a photo of french fries covered in caramel"}
+        facts, errors = gap_fill.apply_fill(
+            [], {"no_fact": [{"ref": "m0.1", "reason": "the photo shows french fries covered in caramel"}]},
+            [{"ref": "m0.1"}], aliases, texts)
+        self.assertEqual((facts, errors), ([], {}))
+
+    def test_nested_gap_value_keeps_a_structured_error_instead_of_type_error(self):
+        aliases = {"m0.1": "source"}
+        texts = {"m0.1": "a photo of french fries"}
+        _, errors = gap_fill.apply_fill(
+            [], {"covered": [{"ref": "m0.1", "index": 0, "quote": {"text": "fries"}}]},
+            [{"ref": "m0.1"}], aliases, texts)
+        self.assertIn("m0.1", errors)
+        self.assertEqual(errors.error_details["m0.1"]["path"], "covered[0].quote")
+        self.assertEqual(errors.error_details["m0.1"]["actual"], {"text": "fries"})
+        self.assertIn("non-empty string", errors.error_details["m0.1"]["expected"])
+        self.assertIn("french fries", errors.error_details["m0.1"]["source"])
+
     def test_add_revises_and_appends_facts_in_the_same_conversation(self):
         model = ScriptedModel(EXTRACTION, FILL)
         with CollectionStore() as store:
@@ -146,6 +166,21 @@ class GapFillTests(unittest.TestCase):
                               {"no_fact": [{"ref": "m1.1", "reason": "already saved"}]})
         with self.assertRaises(SearchLoopError):
             CollectionEngine(CollectionStore(), model).fill_gaps(history(), EXTRACTION)
+
+    def test_changing_unresolved_gap_replies_have_a_bound_and_keep_the_reason(self):
+        replies = [{"no_fact": [{"ref": "m0.1", "reason": "greeting"},
+                               {"ref": "m1.1", "reason": f"already saved version {index}"}]}
+                   for index in range(3)]
+        model = ScriptedModel(*replies)
+        with CollectionStore() as store:
+            engine = CollectionEngine(store, model)
+            with self.assertRaisesRegex(ModelError, "collection_gap_fill.*3 次补漏.*m1.1"):
+                engine.fill_gaps(history(), EXTRACTION)
+            self.assertEqual(len(model.calls), 3)
+            self.assertFalse(engine.trace[-1]["output_validation"]["retry_scheduled"])
+            self.assertTrue(all("output_validation" in call for call in model.calls))
+            self.assertEqual([g["ref"] for g in json.loads(model.calls[-1]["messages"][-1]["content"])["flagged"]],
+                             ["m1.1"])
 
     def test_flagged_paragraphs_are_asked_in_batches(self):
         with patch.object(gap_fill, "BATCH", 1):

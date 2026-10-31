@@ -87,6 +87,18 @@ class AMLContractTests(unittest.TestCase):
         self.assertEqual(self.client.post("/missing", json={}).status_code, 404)
         self.assertEqual(self.client.post("/add", content="broken json").status_code, 400)
 
+    def test_exhausted_model_output_returns_502_with_stage_and_reason(self):
+        model = ScriptedModel(*({"facts": f"bad-{i}"} for i in range(3)))
+        with patch.object(ScriptedModel, "complete", side_effect=model.complete):
+            response = self.client.post("/add", json=self.payload)
+        self.assertEqual(response.status_code, 502, response.text)
+        error = response.json()
+        self.assertEqual(error["type"], "ModelOutputError")
+        self.assertIn("collection_extract", error["error"])
+        self.assertIn("3 次输出尝试", error["error"])
+        self.assertIn("facts", error["error"])
+        self.assertNotIn("data", error)
+
 
 class ChannelPoolApplicationTests(unittest.TestCase):
     def test_round_robin_is_shared_across_application_requests(self):

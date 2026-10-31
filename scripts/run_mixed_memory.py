@@ -41,6 +41,7 @@ from text_memory.collections.relations import PROMPT_HASH as RELATION_PROMPT_HAS
 from text_memory.collections.service import CollectionApplication
 from text_memory.collections.store import CollectionStore
 from text_memory.evaluation import append_jsonl, jsonl, write_json
+from text_memory.errors import ModelError
 from text_memory.mixed_eval import PIPELINES
 from text_memory.model import HttpJsonModel, ModelChannelPool, ModelConfig
 from text_memory.usage import RuntimeConcurrency
@@ -252,6 +253,7 @@ def search(args):
             # after a delay; never export material selected under a default.
             for attempt in range(SEARCH_ATTEMPTS if query["user_id"] in applications else 0):
                 current.model = None
+                retryable = False
                 try:
                     result, data = applications[query["user_id"]].search(body)
                     error = None
@@ -259,8 +261,11 @@ def search(args):
                 except Exception as failure:
                     error = f"{type(failure).__name__}: {failure}"
                     data = []
+                    retryable = isinstance(failure, ModelError)
                 finally:
                     calls += current.model.calls if current.model else []
+                if not retryable:
+                    break
                 if attempt + 1 < SEARCH_ATTEMPTS:
                     time.sleep(SEARCH_RETRY_DELAY * (attempt + 1))
             try:
@@ -278,11 +283,14 @@ def search(args):
         embedder.close()
     failed = [r["id"] for r in rows if r["error"]]
     if failed:
+        (output / "contexts.jsonl").unlink(missing_ok=True)
+        (output / "search-stats.json").unlink(missing_ok=True)
         write_json(output / "search-failures.json", {r["id"]: r["error"] for r in rows if r["error"]})
         return {"questions": len(rows), "failed_this_run": failed, "failures": str(output / "search-failures.json")}
     temporary = output / "contexts.jsonl.tmp"
     temporary.write_text("".join(json.dumps({"id": r["id"], "context": r["context"]}, ensure_ascii=False) + "\n" for r in rows))
     temporary.replace(output / "contexts.jsonl")
+    (output / "search-failures.json").unlink(missing_ok=True)
     write_json(output / "search-stats.json", {"questions": len(rows), "empty_contexts": sum(not r["context"] for r in rows),
                "context_chars": {r["id"]: len(r["context"]) for r in rows},
                "elapsed_seconds": {r["id"]: r["elapsed_seconds"] for r in rows}})

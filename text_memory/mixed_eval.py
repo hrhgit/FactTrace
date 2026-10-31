@@ -7,9 +7,10 @@ used only when grading, never in answer prompts.
 """
 from __future__ import annotations
 
-import json
-
 from .answer_templates import load_pipeline_file
+from .agent_loop import AgentLoop
+from .errors import InvalidOutputError, ValidationError
+from .model import decode_json_object
 from .schema import require
 
 PIPELINES = {
@@ -56,9 +57,40 @@ def answer_messages(task: dict, question: str, context: str, model: str) -> list
     return messages + [{"role": "system", "content": module.MCQ_PROMPT_TEMPLATE.format(options=options)}]
 
 
-def _judge(judge, prompt: str, *, system: str | None = None) -> str:
+def _judge(judge, prompt: str, parse, *, system: str | None = None):
     messages = ([{"role": "system", "content": system}] if system else []) + [{"role": "user", "content": prompt}]
-    return judge.complete_text(messages, purpose="judge", temperature=0)
+    parsed = None
+
+    def validate(response):
+        nonlocal parsed
+        try:
+            parsed = parse(response)
+        except (ValueError, InvalidOutputError) as error:
+            raise ValidationError(str(error)) from error
+
+    response = AgentLoop(judge, messages, purpose="judge", trace=[]).complete_text(validate=validate, temperature=0)
+    return response, parsed
+
+
+def _equivalent(response):
+    label = response.strip().strip("*`").removesuffix(".").casefold()
+    require(label in {"yes", "no"}, "事件对应判断必须返回 YES 或 NO")
+    return label == "yes"
+
+
+def _clbench_payload(response, module, count):
+    # Validate before the vendor's coercion helpers: they otherwise turn a
+    # malformed score or missing statuses into a seemingly valid zero.
+    payload = decode_json_object(response)
+    score = payload.get("Overall Score")
+    valid_score = ((type(score) in (int, float) and score in (0, 1))
+                   or (isinstance(score, str) and score.strip() in {"0", "1"}))
+    require(valid_score, "CL-Bench 的 Overall Score 必须是 0 或 1")
+    statuses = module._coerce_status_list(payload.get("List of Requirement Satisfaction Status"))
+    require(len(statuses) == count and all(s.strip().lower() in {"yes", "no", "y", "n", "true", "false", "1", "0"}
+                                           for s in statuses),
+            f"CL-Bench 必须逐项返回 {count} 个 yes/no 评分判断")
+    return payload, statuses
 
 
 def grade(task: dict, question: str, label: dict, answer: str, judge) -> dict:
@@ -66,13 +98,15 @@ def grade(task: dict, question: str, label: dict, answer: str, judge) -> dict:
     dataset = task["dataset"]
     module = pipeline(dataset)
     if dataset in {"locomo-refined", "longmemeval"}:
-        response = _judge(judge, module.render_accuracy_prompt(label | {"question": question}, answer))
-        correct = module.parse_judge_label(response) == "CORRECT"
+        response, parsed = _judge(judge, module.render_accuracy_prompt(label | {"question": question}, answer),
+                                  module.parse_judge_label)
+        correct = parsed == "CORRECT"
         return {"score": float(correct), "correct": correct, "judge_response": response}
     if dataset == "beam":
         rubrics = module.rubric_items(label)
-        response = _judge(judge, module.render_batch_judge_prompt(question, answer, rubrics))
-        scores = module.parse_rubric_scores(response, len(rubrics))
+        require(bool(rubrics), "BEAM 题目没有评分要求")
+        response, scores = _judge(judge, module.render_batch_judge_prompt(question, answer, rubrics),
+                                  lambda response: module.parse_rubric_scores(response, len(rubrics)))
         result = {"score": sum(s["score"] for s in scores) / len(scores),
                   "rubric_scores": [{"rubric": r, "score": s["score"], "reason": s["reason"]} for r, s in zip(rubrics, scores)],
                   "judge_response": response}
@@ -84,9 +118,9 @@ def grade(task: dict, question: str, label: dict, answer: str, judge) -> dict:
                 for index, expected in enumerate(rubrics):
                     if index in used:
                         continue
-                    reply = _judge(judge, f"First snippet: {expected}\n\nSecond snippet: {candidate}",
-                                   system=module.EQUIVALENCE_SYSTEM_PROMPT)
-                    if "yes" in reply.casefold():
+                    _, equivalent = _judge(judge, f"First snippet: {expected}\n\nSecond snippet: {candidate}",
+                                           _equivalent, system=module.EQUIVALENCE_SYSTEM_PROMPT)
+                    if equivalent:
                         match = index
                         break
                 system.append(candidate if match is None else rubrics[match])
@@ -101,14 +135,9 @@ def grade(task: dict, question: str, label: dict, answer: str, judge) -> dict:
         if not normalized:
             # The official grader counts an empty answer as 0 without a judge call.
             return {"score": 0.0, "requirement_ratio": 0.0, "rationale": "No model output (counted as score 0)"}
-        response = _judge(judge, module.rubric_judge_prompt(rubrics_text=module._build_rubrics_text(rubrics),
-                                                            model_output=normalized))
-        text = response.strip()
-        for prefix in ("```json", "```"):
-            text = text.removeprefix(prefix)
-        payload = json.loads(text.removesuffix("```").strip())
-        require(isinstance(payload, dict) and "Overall Score" in payload, "CL-Bench 评分结果缺少 Overall Score")
-        statuses = module._coerce_status_list(payload.get("List of Requirement Satisfaction Status", []))
+        response, (payload, statuses) = _judge(judge, module.rubric_judge_prompt(
+            rubrics_text=module._build_rubrics_text(rubrics), model_output=normalized),
+            lambda response: _clbench_payload(response, module, len(rubrics)))
         return {"score": float(module._coerce_score(payload)), "requirement_status": statuses,
                 "requirement_ratio": module._compute_requirement_ratio(statuses),
                 "rationale": str(payload.get("Grading Rationale", "") or ""), "judge_response": response}

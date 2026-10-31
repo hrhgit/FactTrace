@@ -1,7 +1,11 @@
 import json
 import os
 import unittest
+from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
+from pathlib import Path
+import tempfile
 from unittest.mock import patch
 
 import httpx
@@ -283,26 +287,122 @@ class HttpJsonModelChannelTests(unittest.TestCase):
         for secret in ("one-secret", "two-secret", "three-secret", "https://"):
             self.assertNotIn(secret, message)
 
-    def test_successful_http_response_is_not_replayed_after_output_errors(self):
-        cases = (
-            ("complete", reply("one-model", "{broken"), InvalidOutputError),
-            ("complete_text", reply("one-model", "truncated", "length"), ModelError),
-            ("complete_text", httpx.Response(200, json={"unexpected": []}), ModelError),
-        )
-        for method, response, error_type in cases:
-            with self.subTest(method=method, error_type=error_type):
-                hosts = []
+    def test_bad_json_content_is_left_to_the_correction_conversation(self):
+        model = HttpJsonModel(channels(), transport=httpx.MockTransport(lambda _: reply(content="{broken")))
+        with self.assertRaises(InvalidOutputError):
+            model.complete(self.messages, purpose="extract")
+        self.assertEqual(len(model.calls), 1)
+        self.assertEqual(model.calls[0]["status"], "invalid_output")
+
+    def test_bad_service_responses_retry_in_place_then_fail_over(self):
+        bad_responses = [
+            httpx.Response(200, text="not json"),
+            httpx.Response(200, json=[]),
+            httpx.Response(200, json={"unexpected": []}),
+            httpx.Response(200, json={"choices": []}),
+            httpx.Response(200, json={"choices": [None]}),
+            reply(content="truncated", finish_reason="length"),
+            reply(finish_reason=[]),
+            httpx.Response(200, json={"choices": [{"finish_reason": "stop"}]}),
+            httpx.Response(200, json={"choices": [{"finish_reason": "stop", "message": {}}]}),
+            reply(content=None),
+            reply(content=["text"]),
+        ]
+        for response in bad_responses:
+            for recover_in_place in (True, False):
+                with self.subTest(response=response.text, recover_in_place=recover_in_place):
+                    hosts = []
+
+                    def handler(request):
+                        hosts.append(request.url.host)
+                        failed = request.url.host == "one.invalid" and (not recover_in_place or len(hosts) == 1)
+                        return response if failed else reply()
+
+                    model = HttpJsonModel(channels(), transport=httpx.MockTransport(handler), max_retries=1,
+                                          sleep=lambda _: None)
+                    self.addCleanup(model.usage.close)
+                    self.assertEqual(model.complete_text(self.messages, purpose="answer"), "ok")
+                    self.assertEqual(hosts, ["one.invalid", "one.invalid"] + ([] if recover_in_place else ["two.invalid"]))
+                    self.assertTrue(model.calls[0]["retry_scheduled"])
+                    self.assertIn("error_message", model.calls[0])
+                    if not recover_in_place:
+                        self.assertTrue(model.calls[1]["failover_scheduled"])
+
+    def test_empty_answer_sends_feedback_and_eventually_fails_visibly(self):
+        for recover in (True, False):
+            with self.subTest(recover=recover):
+                received = []
 
                 def handler(request):
-                    hosts.append(request.url.host)
-                    return response if request.url.host == "one.invalid" else reply("two-model")
+                    received.append(json.loads(request.content)["messages"])
+                    return reply(content="recovered" if recover and len(received) == 2 else "  ")
 
-                model = HttpJsonModel(channels(), transport=httpx.MockTransport(handler), max_retries=0)
-                with self.assertRaises(error_type):
-                    getattr(model, method)(self.messages, purpose="answer")
-                self.assertEqual(hosts, ["one.invalid"])
-                self.assertEqual(len(model.calls), 1)
-                self.assertNotEqual(model.calls[0]["status"], "completed")
+                model = HttpJsonModel(channels(), transport=httpx.MockTransport(handler), max_retries=1,
+                                      sleep=lambda _: None)
+                self.addCleanup(model.usage.close)
+                if recover:
+                    self.assertEqual(model.complete_text(self.messages, purpose="answer"), "recovered")
+                else:
+                    with self.assertRaisesRegex(ModelError, "answer.*2 次输出尝试.*渠道 2"):
+                        model.complete_text(self.messages, purpose="answer")
+                    self.assertFalse(model.calls[-1]["output_validation"]["retry_scheduled"])
+                self.assertEqual(len(received), 2)
+                self.assertEqual(received[1][:1], self.messages)
+                self.assertIn("tool_error", json.loads(received[1][-1]["content"]))
+                self.assertEqual(len(self.messages), 1)
+
+    def test_exhausted_error_counts_only_this_request_and_redacts_service_detail(self):
+        first = True
+
+        def handler(request):
+            nonlocal first
+            if first:
+                first = False
+                return reply()
+            return httpx.Response(503, text="busy " + request.headers["Authorization"]
+                                  + " https://private.invalid/v1 " + self.messages[0]["content"])
+
+        model = HttpJsonModel(channels(), transport=httpx.MockTransport(handler), max_retries=1,
+                              sleep=lambda _: None)
+        self.addCleanup(model.usage.close)
+        model.complete_text(self.messages, purpose="previous")
+        with self.assertRaises(ModelError) as caught:
+            model.complete_text(self.messages, purpose="answer")
+        message = str(caught.exception)
+        self.assertIn("本次实际请求 6 次", message)
+        self.assertIn("最后失败渠道 1", message)
+        self.assertIn("HTTP 503", message)
+        self.assertIn("busy", message)
+        for hidden in ("one-secret", "two-secret", "three-secret", "private.invalid", "question"):
+            self.assertNotIn(hidden, message)
+        self.assertEqual(len(model.calls), 7)
+
+    def test_local_parser_bug_is_not_retried_as_a_model_failure(self):
+        model = HttpJsonModel(channels(), transport=httpx.MockTransport(lambda _: reply(content="{}")))
+        with patch("text_memory.model.decode_json_object_with_meta", side_effect=TypeError("local defect")):
+            with self.assertRaisesRegex(TypeError, "local defect"):
+                model.complete(self.messages, purpose="extract")
+        self.assertEqual(len(model.calls), 1)
+
+    def test_concurrent_requests_share_round_robin_position_across_pools(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            config = replace(channels(), usage_path=str(Path(temporary) / "usage.sqlite"))
+            pools = [ModelChannelPool(config), ModelChannelPool(config)]
+            try:
+                transport = httpx.MockTransport(lambda request: reply(content=json.loads(request.content)["model"]))
+
+                def one(index):
+                    model = HttpJsonModel(config, channel_pool=pools[index % 2], transport=transport)
+                    return model.complete_text(self.messages, purpose="answer")
+
+                with ThreadPoolExecutor(max_workers=12) as executor:
+                    answers = list(executor.map(one, range(60)))
+                self.assertEqual(Counter(answers), {"one-model": 20, "two-model": 20, "three-model": 20})
+                self.assertTrue(all(channel["usage"]["unfinished_requests"] == 0
+                                    for channel in pools[0].snapshot()["channels"]))
+            finally:
+                for pool in pools:
+                    pool.usage.close()
 
 
 if __name__ == "__main__":

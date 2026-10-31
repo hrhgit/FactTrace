@@ -26,13 +26,16 @@ _ITEM = re.compile(r"\s*(?:[-*•+]\s|\d+[.)]\s|#{1,6}\s|\*\*[^*]+\*\*)")
 _SENTENCE_END = re.compile(r"(?<=[.!?。！？])\s+")
 
 
-def require(condition: bool, message: str) -> None:
+def require(condition: bool, message: str, **diagnostic) -> None:
     if not condition:
-        raise ValidationError(message)
+        raise ValidationError(message, **diagnostic)
 
 
-def text(value: object, name: str) -> str:
-    require(isinstance(value, str) and bool(value.strip()), f"{name} 必须是非空文字")
+def text(value: object, name: str, *, path=None, expected="a non-empty string", source=None,
+         model_message=None) -> str:
+    require(isinstance(value, str) and bool(value.strip()), f"{name} 必须是非空文字",
+            path=path, actual=value, expected=expected, source=source,
+            model_message=model_message or f"{path or name} must be a non-empty string.")
     return value
 
 

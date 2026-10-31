@@ -11,7 +11,7 @@ from typing import Callable, Protocol, Sequence
 
 import httpx
 
-from .errors import ConfigurationError, InvalidOutputError, ModelError
+from .errors import ConfigurationError, InvalidOutputError, ModelError, ModelOutputError
 from .usage import (PRICE_DATE, PRICE_SOURCE, REFERENCE_PRICES, ChannelConcurrencyError, UsageLedger, UsageLimitError,
                     default_source, key_identity, reference_price, usage_path_from_env)
 
@@ -100,6 +100,27 @@ def _without_extra_json_closers(candidate: str) -> str | None:
     return candidate[:end]
 
 
+def _json_parse_details(candidate: str, error: json.JSONDecodeError) -> dict:
+    """Expose the parser's exact location without attempting a semantic repair."""
+    position = max(0, min(error.pos, len(candidate)))
+    radius = 80
+    start, end = max(0, position - radius), min(len(candidate), position + radius)
+    excerpt = candidate[start:end]
+    return {
+        "path": "$",
+        "actual": candidate,
+        "expected": "a valid JSON object",
+        "source": excerpt,
+        "details": {
+            "line": error.lineno,
+            "column": error.colno,
+            "position": error.pos,
+            "excerpt_start": start,
+            "excerpt_end": end,
+        },
+    }
+
+
 def decode_json_object_with_meta(content: str) -> tuple[dict, bool]:
     """Decode JSON and apply only the approved syntax repairs.
 
@@ -112,25 +133,42 @@ def decode_json_object_with_meta(content: str) -> tuple[dict, bool]:
     retried as model output.
     """
     if not content.strip():
-        raise InvalidOutputError(content, "模型没有返回非空 JSON 内容")
+        raise InvalidOutputError(content, "模型没有返回非空 JSON 内容", path="$", actual=content,
+                                 expected="a non-empty JSON object",
+                                 model_message="Return a non-empty JSON object.")
     candidate = _strip_json_fence(content)
     try:
         result = json.loads(candidate)
-    except ValueError as error:
+    except json.JSONDecodeError as error:
         repaired = _one_missing_json_closer(candidate)
         if repaired is None:
             repaired = _without_extra_json_closers(candidate)
         if repaired is None:
-            raise InvalidOutputError(content, "模型回复无法解析为 JSON") from error
+            raise InvalidOutputError(
+                content, "模型回复无法解析为 JSON", model_message=(
+                    "The response is not valid JSON. Correct the syntax and return the full JSON object."),
+                **_json_parse_details(candidate, error)) from error
         try:
             result = json.loads(repaired)
-        except ValueError:
-            raise InvalidOutputError(content, "模型回复无法解析为 JSON") from error
+        except json.JSONDecodeError as repaired_error:
+            raise InvalidOutputError(
+                content, "模型回复无法解析为 JSON", model_message=(
+                    "The response is not valid JSON. Correct the syntax and return the full JSON object."),
+                **_json_parse_details(repaired, repaired_error)) from repaired_error
         repaired_output = True
     else:
         repaired_output = candidate != content.strip()
     if not isinstance(result, dict):
-        raise InvalidOutputError(content, "模型输出必须是 JSON 对象")
+        raise InvalidOutputError(content, "模型输出必须是 JSON 对象", path="$", actual=result,
+                                 expected="a JSON object", source=candidate,
+                                 model_message="Return a JSON object at the top level.")
+    try:
+        encode(result)
+    except ValueError as error:
+        raise InvalidOutputError(
+            content, "模型 JSON 不能包含 NaN 或 Infinity 等非有限数字", path="$", actual=result,
+            expected="JSON values without NaN or Infinity", source=candidate,
+            model_message="Return JSON values without NaN or Infinity.") from error
     return result, repaired_output
 
 
@@ -323,6 +361,14 @@ class _ChannelRequestError(ModelError):
     pass
 
 
+class _ResponseFormatError(ModelError):
+    """The provider answered, but its response envelope cannot be consumed."""
+
+    def __init__(self, message: str, *, status: str = "invalid_response"):
+        super().__init__(message)
+        self.status = status
+
+
 class HttpJsonModel:
     _RETRYABLE_STATUSES = frozenset({408, 425, 429, 500, 502, 503, 504})
     _NON_RETRYABLE_MARKERS = (
@@ -346,8 +392,8 @@ class HttpJsonModel:
         self.usage = self.channel_pool.usage
         self.transport = transport
         self.calls: list[dict] = []
-        if max_retries < 0:
-            raise ValueError("max_retries must be non-negative")
+        if type(max_retries) is not int or max_retries < 0:
+            raise ValueError("max_retries must be a non-negative integer")
         if retry_base_delay_s < 0 or retry_jitter_s < 0:
             raise ValueError("retry delays must be non-negative")
         self.max_retries = max_retries
@@ -366,39 +412,57 @@ class HttpJsonModel:
         # retry_index is the index of the failed attempt (0 for the first one).
         return self.retry_base_delay_s * (2 ** retry_index) + random.uniform(0, self.retry_jitter_s)
 
+    @staticmethod
+    def _safe_provider_detail(detail: str, api_key: str, messages=()) -> str:
+        """Keep useful provider diagnostics without exposing credentials or URLs."""
+        value = detail.replace(api_key, "[REDACTED]") if api_key else detail
+        for message in messages:
+            content = message.get("content")
+            if isinstance(content, str) and content:
+                value = value.replace(content, "[PROMPT]")
+                value = value.replace(json.dumps(content, ensure_ascii=False)[1:-1], "[PROMPT]")
+        value = " ".join(value.split())
+        value = re.sub(r"(?i)\bBearer\s+\S+", "Bearer [REDACTED]", value)
+        value = re.sub(r"https?://\S+", "[URL]", value)
+        return value[:240] + ("…" if len(value) > 240 else "")
+
     def _post(self, body: dict, messages: list[dict], purpose: str, finished: set[str], parse):
         """Try channels in configured order, with bounded retries within each channel."""
         selection = self.channel_pool.selection()
         channels = selection["channels"]
+        records = []
         last_error = None
         for failover_index, (channel_index, channel) in enumerate(channels):
             try:
                 return self._post_channel(channel, channel_index, failover_index,
                                           body, messages, purpose, finished, parse,
-                                          selection=selection)
+                                          selection=selection, records=records)
             except _ChannelRequestError as error:
                 last_error = error
-                self.calls[-1]["failover_scheduled"] = failover_index + 1 < len(channels)
+                records[-1]["failover_scheduled"] = failover_index + 1 < len(channels)
         # A failed HTTP attempt can consume the last remaining allowance. Check
         # again so that this same request can continue on the authorized key.
         if not selection["terminal_fallback"] and self.channel_pool.exhausted_fallback_ready():
             fallback_index = selection["exhausted_fallback"]
-            self.calls[-1]["failover_scheduled"] = True
+            records[-1]["failover_scheduled"] = True
             try:
                 return self._post_channel(self.channels[fallback_index - 1], fallback_index, len(channels),
                                           body, messages, purpose, finished, parse,
-                                          selection=selection | {"terminal_fallback": True})
+                                          selection=selection | {"terminal_fallback": True}, records=records)
             except _ChannelRequestError as error:
                 last_error = error
-                self.calls[-1]["failover_scheduled"] = False
-        if len(channels) == 1:
-            raise last_error
-        raise ModelError(f"{len(channels)} 个模型渠道均请求失败；最后错误：{last_error}") from last_error
+                records[-1]["failover_scheduled"] = False
+        last = records[-1]
+        attempts = sum("usage_attempt_id" in record for record in records)
+        count = len({record["channel_index"] for record in records})
+        raise ModelError(f"{purpose} 阶段：{count} 个模型渠道均请求失败；本次实际请求 {attempts} 次；"
+                         f"最后失败渠道 {last['channel_index']}（{last['requested_model']}）；"
+                         f"最后错误：{last_error}") from last_error
 
     def _post_channel(self, channel: ModelConfig, channel_index: int, failover_index: int,
                       body: dict, messages: list[dict], purpose: str, finished: set[str], parse,
-                      *, selection: dict):
-        """Post to one channel; successful HTTP responses are never replayed elsewhere."""
+                      *, selection: dict, records: list):
+        """Retry service/envelope failures; leave content correction to the caller."""
         url = channel.base_url.rstrip("/") + "/chat/completions"
         channel_body = dict(body)
         channel_body["model"] = channel.model
@@ -422,6 +486,7 @@ class HttpJsonModel:
             if request_parameters:
                 record["request_parameters"] = request_parameters
             self.calls.append(record)
+            records.append(record)
             terminal_fallback = (selection.get("terminal_fallback")
                                  and channel_index == selection.get("exhausted_fallback"))
             if terminal_fallback:
@@ -438,7 +503,8 @@ class HttpJsonModel:
                     record["waiting_for_channel_slot"] = True
                     self._sleep(0.1)
                 except UsageLimitError as error:
-                    record.update(status="usage_limit", retry_scheduled=False)
+                    record.update(status="usage_limit", retry_scheduled=False,
+                                  error_type=type(error).__name__, error_message=str(error))
                     raise _ChannelRequestError(str(error)) from error
             record["usage_attempt_id"] = attempt_id
             response_usage = None
@@ -454,10 +520,25 @@ class HttpJsonModel:
                         record["accounting_error"] = True
                         raise
 
+            def retry_response_error(error: _ResponseFormatError):
+                """Record and retry a bad provider response without treating it as success."""
+                record.update(status=error.status, error_type=type(error).__name__,
+                              error_message=str(error), retryable=True)
+                if retry_index >= self.max_retries:
+                    record["retry_scheduled"] = False
+                    message = (f"{purpose} 阶段：{str(error)}；渠道 {channel_index}"
+                               f"（{channel.model}）已尝试 {retry_index + 1} 次")
+                    raise _ChannelRequestError(message) from error
+                delay = self._retry_delay(retry_index)
+                record.update(retry_scheduled=True, retry_delay_s=delay)
+                account()
+                self._sleep(delay)
+
             try:
                 with httpx.Client(timeout=None, transport=self.transport) as client:
                     response = client.post(url, headers={"Authorization": "Bearer " + channel.api_key},
                                            json=channel_body)
+                record["http_status"] = response.status_code
                 if response.status_code >= 400:
                     record.update(status="http_error", http_status=response.status_code)
                     try:
@@ -470,6 +551,8 @@ class HttpJsonModel:
                     # Preserve provider diagnostics locally without retaining credentials.
                     detail = response.text.replace(channel.api_key, "[REDACTED]")
                     record["http_error_body"] = detail
+                    provider_detail = self._safe_provider_detail(detail, channel.api_key, messages)
+                    record.update(error_type="HTTPError", error_message=provider_detail)
                     retryable = self._is_retryable_http_error(response.status_code, detail)
                     record["retryable"] = retryable
                     if retryable and retry_index < self.max_retries:
@@ -480,33 +563,46 @@ class HttpJsonModel:
                         continue
                     record["retry_scheduled"] = False
                     suffix = "，已停止自动重试" if retryable else "，不会自动重试"
+                    if provider_detail:
+                        suffix += "；服务提示：" + provider_detail
                     raise _ChannelRequestError(f"模型请求失败（HTTP {response.status_code}）{suffix}")
-                payload = response.json()
+                try:
+                    payload = response.json()
+                except ValueError as error:
+                    raise _ResponseFormatError("模型响应不是有效 JSON") from error
                 response_usage = payload.get("usage") if isinstance(payload, dict) else None
                 record["usage"] = response_usage
-                if not isinstance(payload, dict) or not isinstance(payload.get("choices"), list):
-                    raise ModelError("模型返回的响应结构无效")
-                choice = payload["choices"][0]
+                if not isinstance(payload, dict):
+                    raise _ResponseFormatError("模型响应必须是 JSON 对象")
+                record.update(actual_model=payload.get("model"), response=payload)
+                choices = payload.get("choices")
+                if not isinstance(choices, list) or not choices:
+                    raise _ResponseFormatError("模型响应的 choices 必须是非空数组")
+                choice = choices[0]
                 if not isinstance(choice, dict):
-                    raise ModelError("模型返回的响应结构无效")
-                record.update(actual_model=payload.get("model"), usage=payload.get("usage"),
-                              finish_reason=choice.get("finish_reason"), response=payload)
-                if choice.get("finish_reason") not in finished:
-                    raise ModelError("模型未正常完成输出：" + str(choice.get("finish_reason")))
-                message = choice["message"]
+                    raise _ResponseFormatError("模型响应的 choices[0] 必须是对象")
+                record.update(usage=payload.get("usage"), finish_reason=choice.get("finish_reason"))
+                finish_reason = choice.get("finish_reason")
+                if not isinstance(finish_reason, str) or finish_reason not in finished:
+                    raise _ResponseFormatError(
+                        "模型未正常完成输出（finish_reason=" + self._safe_provider_detail(
+                            repr(finish_reason), channel.api_key, messages) + "）",
+                        status="incomplete_output")
+                message = choice.get("message")
                 if not isinstance(message, dict) or "content" not in message:
-                    raise ModelError("模型返回的响应结构无效")
+                    raise _ResponseFormatError("模型响应的 message 必须包含 content")
                 content = message["content"]
                 if content is None:
-                    content = ""
+                    raise _ResponseFormatError("模型响应的 content 不能是 null")
                 if not isinstance(content, str):
-                    raise ModelError("模型返回的响应内容结构无效")
+                    raise _ResponseFormatError("模型响应的 content 必须是文字")
                 result = parse(message, content)
                 record["status"] = "completed"
                 return result
             except httpx.HTTPError as error:
                 record.update(status="transport_error", retryable=True,
-                              transport_error_type=type(error).__name__)
+                              transport_error_type=type(error).__name__,
+                              error_type=type(error).__name__, error_message="无法连接模型服务")
                 if retry_index < self.max_retries:
                     delay = self._retry_delay(retry_index)
                     record.update(retry_scheduled=True, retry_delay_s=delay)
@@ -515,13 +611,17 @@ class HttpJsonModel:
                     continue
                 record["retry_scheduled"] = False
                 # Do not include provider URLs, headers or secrets in public errors.
-                raise _ChannelRequestError("无法连接模型服务，自动重试已用尽") from error
-            except ModelError:
-                record.setdefault("status", "invalid_output")
+                raise _ChannelRequestError(
+                    f"无法连接模型服务（{type(error).__name__}），自动重试已用尽") from error
+            except _ResponseFormatError as error:
+                retry_response_error(error)
+                continue
+            except InvalidOutputError as error:
+                record.update(status="invalid_output", error_type=type(error).__name__, error_message=str(error))
                 raise
-            except (KeyError, IndexError, TypeError, ValueError) as error:
-                record["status"] = "invalid_response"
-                raise ModelError("模型返回的结构或 JSON 无效") from error
+            except ModelError:
+                record.setdefault("status", "model_error")
+                raise
             finally:
                 # One accounting write per actual HTTP attempt. Even malformed
                 # model output can be billed, so record usage before callers retry it.
@@ -546,14 +646,40 @@ class HttpJsonModel:
         """A plain-text reply, for answers that need no structure."""
         def parse(message: dict, content: str) -> str:
             if not content.strip():
-                raise InvalidOutputError(content, "模型没有返回回答文字")
+                raise InvalidOutputError(content, "模型没有返回回答文字", path="$", actual=content,
+                                         expected="non-empty answer text",
+                                         model_message="Return a non-empty answer in the required format.")
             return content.strip()
         body = {"model": self.config.model, "messages": messages}
         if temperature is not None:
             body["temperature"] = temperature
         if self.config.reasoning_effort is not None:
             body["reasoning_effort"] = self.config.reasoning_effort
-        return self._post(body, messages, purpose, {"stop"}, parse)
+        retry_messages = list(messages)
+        for output_retry in range(self.max_retries + 1):
+            try:
+                return self._post(body | {"messages": retry_messages}, retry_messages,
+                                  purpose, {"stop"}, parse)
+            except InvalidOutputError as error:
+                feedback = {"type": type(error).__name__, **error.diagnostic(),
+                            "message": (error.model_message or
+                                        "The model output failed validation."),
+                            "instruction": "Return a complete answer in the required format."}
+                self.calls[-1]["output_validation"] = {
+                    "type": type(error).__name__, "message": str(error),
+                    "model_message": feedback["message"], **error.diagnostic(),
+                    "attempt": output_retry + 1,
+                    "retry_scheduled": output_retry < self.max_retries}
+                if output_retry >= self.max_retries:
+                    raise ModelOutputError(
+                        f"{purpose} 阶段在 {output_retry + 1} 次输出尝试后仍失败；"
+                        f"最后渠道 {self.calls[-1]['channel_index']}（{self.calls[-1]['requested_model']}）；"
+                        f"{type(error).__name__}：{error}") from error
+                retry_messages = [*retry_messages,
+                                  {"role": "assistant", "content": error.raw_content},
+                                  {"role": "user", "content": json.dumps(
+                                      {"tool_error": feedback}, ensure_ascii=False)}]
+                self._sleep(self._retry_delay(output_retry))
 
     def usage_snapshot(self) -> dict:
         return self.channel_pool.snapshot()

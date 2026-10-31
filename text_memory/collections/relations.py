@@ -121,18 +121,50 @@ class RelationAnnotator:
 
     def judge(self, batch, record):
         ids = [f'p{n}' for n in range(len(batch))]
-        def validate(reply):
-            require(isinstance(reply, dict) and isinstance(reply.get('pairs'), list), 'pairs 必须是数组')
-            answered = {}
-            for item in reply['pairs']:
-                require(isinstance(item, dict) and item.get('id') in ids and item['id'] not in answered,
-                        '每个配对编号必须出现且只出现一次')
-                require(item.get('relation') in (*RELATIONS, 'none'), '关系必须是 ' + ', '.join((*RELATIONS, 'none')))
-                answered[item['id']] = item['relation']
-            require(len(answered) == len(ids), '每个配对都需要一个关系')
         facts = list(dict.fromkeys(i for pair in batch for i in pair))
         names = {i: f'r{n}' for n, i in enumerate(facts)}
         messages, rows = shared_messages(map(record, facts))
+        pair_sources = {
+            pair_id: f"A: {record(a)['text']}\nB: {record(b)['text']}"
+            for pair_id, (a, b) in zip(ids, batch)
+        }
+
+        def validate(reply):
+            require(isinstance(reply, dict) and isinstance(reply.get('pairs'), list), 'pairs 必须是数组',
+                    path='pairs', actual=(reply.get('pairs') if isinstance(reply, dict) else reply),
+                    expected='an array of pair relation objects',
+                    source='\n'.join(pair_sources.values()),
+                    model_message='pairs must be an array of pair relation objects.')
+            answered = {}
+            for index, item in enumerate(reply['pairs']):
+                path = f'pairs[{index}]'
+                require(isinstance(item, dict) and set(item) == {'id', 'relation'},
+                        '每个配对项目必须只有 id/relation', path=path, actual=item,
+                        expected='an object with exactly id and relation keys',
+                        source='\n'.join(pair_sources.values()),
+                        model_message=f'{path} must be an object with exactly id and relation keys.')
+                pair_id = item.get('id')
+                pair_source = pair_sources.get(pair_id) if isinstance(pair_id, str) else None
+                require(pair_id in ids, '配对编号不在本次请求中', path=f'{path}.id', actual=pair_id,
+                        expected=ids, source=pair_source,
+                        model_message=f'{path}.id must be one of the requested pair ids: {ids}.')
+                require(pair_id not in answered, '配对编号重复', path=f'{path}.id', actual=pair_id,
+                        expected='each requested pair id exactly once', source=pair_source,
+                        model_message=f'{path}.id is duplicated; return each requested pair id exactly once.')
+                relation = item.get('relation')
+                require(relation in (*RELATIONS, 'none'),
+                        '关系必须是 ' + ', '.join((*RELATIONS, 'none')),
+                        path=f'{path}.relation', actual=relation,
+                        expected=list((*RELATIONS, 'none')), source=pair_source,
+                        model_message=(f'{path}.relation must be one of '
+                                       f'{list((*RELATIONS, "none"))}.'))
+                answered[pair_id] = relation
+            missing = [pair_id for pair_id in ids if pair_id not in answered]
+            require(not missing, '每个配对都需要一个关系', path='pairs', actual=list(answered),
+                    expected=f'every requested pair id exactly once: {ids}',
+                    source='\n'.join(pair_sources.values()),
+                    model_message=f'pairs is missing required pair ids: {missing}.')
+
         reply = self.engine._complete([{'role': 'system', 'content': prompts.RELATION_PAIRS}, {'role': 'user', 'content': encode(
             {'instructions': contracts.relation_pairs(ids),
              'messages': messages, 'records': dict(zip(names.values(), rows)),
@@ -143,9 +175,17 @@ class RelationAnnotator:
 
     def negation(self, statement, near, record):
         ids = [f'r{n}' for n in range(len(near))]
+        source = "\n".join([record(statement)['text'], *(record(i)['text'] for i in near)])
         def validate(reply):
             require(isinstance(reply, dict) and isinstance(reply.get('conflicts'), list)
-                    and all(x in ids for x in reply['conflicts']), 'conflicts 必须是给定记录编号的数组')
+                    , 'conflicts 必须是给定记录编号的数组', path='conflicts',
+                    actual=(reply.get('conflicts') if isinstance(reply, dict) else reply),
+                    expected=f'an array containing only the allowed record ids: {ids}', source=source,
+                    model_message='conflicts must be an array containing only the allowed record ids.')
+            for index, value in enumerate(reply['conflicts']):
+                require(value in ids, 'conflicts 必须是给定记录编号的数组', path=f'conflicts[{index}]',
+                        actual=value, expected=ids, source=source,
+                        model_message=f'conflicts[{index}] must be one of the allowed record ids: {ids}.')
         messages, rows = shared_messages(map(record, [statement, *near]))
         reply = self.engine._complete([{'role': 'system', 'content': prompts.RELATION_NEGATION}, {'role': 'user', 'content': encode(
             {'instructions': contracts.relation_negation(ids),

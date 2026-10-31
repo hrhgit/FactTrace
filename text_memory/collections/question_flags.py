@@ -37,19 +37,45 @@ def check_question(model, question, *, sleep=time.sleep):
     for attempt in range(MAX_ATTEMPTS):
         try:
             reply = model.complete(deepcopy(messages), purpose="question_flags")
-        except (InvalidOutputError, ModelError) as failure:
+            if not (isinstance(reply, dict) and set(reply) == set(FLAGS)
+                    and all(isinstance(reply[k], bool) for k in FLAGS)):
+                raise InvalidOutputError(encode(reply),
+                    "invalid reply: question_flags 必须完整返回 combine、changed、ever 三个布尔值",
+                    path="$", actual=reply,
+                    expected="an object with exactly boolean combine, changed and ever fields",
+                    source=question,
+                    model_message=("Return exactly the three boolean fields combine, changed and ever "
+                                   "and no other fields."))
+            return {k: reply[k] for k in FLAGS}, None
+        except ModelError as failure:
             last_error = failure
+            if isinstance(failure, InvalidOutputError):
+                feedback = {"type": type(failure).__name__, **failure.diagnostic(),
+                            "message": (failure.model_message or
+                                        "Return the complete JSON object required by the output contract."),
+                            "instruction": ("Return the complete JSON object required by the output contract. "
+                                             "Do not add explanations.")}
+                calls = getattr(model, "calls", [])
+                if calls and isinstance(calls[-1], dict):
+                    calls[-1]["output_validation"] = {**feedback, "message": str(failure),
+                                                      "model_message": feedback["message"],
+                                                      "attempt": attempt + 1,
+                                                      "retry_scheduled": attempt + 1 < MAX_ATTEMPTS}
+                if attempt + 1 < MAX_ATTEMPTS:
+                    messages.extend([
+                        deepcopy(failure.assistant_message) if failure.assistant_message is not None
+                        else {"role": "assistant", "content": failure.raw_content},
+                        {"role": "user", "content": encode({"tool_error": feedback})},
+                    ])
             if attempt + 1 < MAX_ATTEMPTS:
                 sleep(ERROR_DELAYS[min(attempt, len(ERROR_DELAYS) - 1)])
-            continue
-        if isinstance(reply, dict) and set(reply) == set(FLAGS) and all(isinstance(reply[k], bool) for k in FLAGS):
-            return {k: reply[k] for k in FLAGS}, None
-        last_error = InvalidOutputError(str(reply), "invalid reply: question_flags 必须完整返回 combine、changed、ever 三个布尔值")
-        if attempt + 1 < MAX_ATTEMPTS:
-            sleep(ERROR_DELAYS[min(attempt, len(ERROR_DELAYS) - 1)])
     if last_error is None:
         raise ModelError(f"question_flags 在 {MAX_ATTEMPTS} 次尝试后没有返回结果")
-    raise ModelError(f"question_flags 在 {MAX_ATTEMPTS} 次尝试后仍失败：{last_error}") from last_error
+    calls = getattr(model, "calls", [])
+    last = calls[-1] if calls and isinstance(calls[-1], dict) else {}
+    channel = (f"；最后渠道 {last['channel_index']}（{last.get('requested_model', '')}）"
+               if "channel_index" in last else "")
+    raise ModelError(f"question_flags 在 {MAX_ATTEMPTS} 次尝试后仍失败{channel}：{last_error}") from last_error
 
 
 def mark_question(model, question):

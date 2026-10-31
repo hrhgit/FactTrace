@@ -73,6 +73,21 @@ class RelationStageTests(unittest.TestCase):
         CollectionEngine(self.store, again, embedder=Embedder(), floor=0.5).add(second)
         self.assertEqual(again.calls, [])
 
+    def test_relation_feedback_identifies_duplicate_pair_id_and_source_records(self):
+        first = session("s1", "2024-03-01", ("user", "I bought a lamp."))
+        self.add(first, extraction(("The user bought a lamp.", 0)))
+        second = session("s2", "2024-03-05", ("user", "I returned the lamp."))
+        bad = {"pairs": [{"id": "p0", "relation": "none"}, {"id": "p0", "relation": "same"}]}
+        good = {"pairs": [{"id": "p0", "relation": "none"}]}
+        model, _ = self.add(second, extraction(("The user returned the lamp.", 0)),
+                            relation_responses=[bad, good])
+        self.assertEqual([c["purpose"] for c in model.calls], ["collection_relation_pairs"] * 2)
+        feedback = json.loads(model.calls[1]["messages"][-1]["content"])["tool_error"]
+        self.assertEqual(feedback["path"], "pairs[1].id")
+        self.assertEqual(feedback["actual"], "p0")
+        self.assertIn("exactly once", feedback["expected"])
+        self.assertIn("The user returned the lamp", feedback["source"])
+
     def test_a_record_shared_by_pairs_is_sent_once(self):
         first = session("s1", "2024-03-01", ("user", "I bought a lamp and a chair."))
         self.add(first, extraction(("The user bought a lamp.", 0), ("The user bought a chair.", 0)))
