@@ -1,0 +1,95 @@
+--- a/data/locomo-refined/pipeline.py
++++ b/data/locomo-refined/pipeline.py
+@@ -78,15 +78,11 @@
+ Gold answer: {gold_answer}
+ Generated answer: {generated_answer}
+ 
+-First, provide a short (one sentence) explanation of your reasoning, then finish with CORRECT or WRONG.
+-Do NOT include both CORRECT and WRONG in your response, or it will break the evaluation script.
+-
+-Just return the label CORRECT or WRONG in a json format with the key as "label":
++Return only one JSON object. Do not include an explanation, Markdown fences, or any other text.
++The value must be exactly CORRECT or WRONG:
+ 
+ ```json
+-{{
+-    "label": "CORRECT" or "WRONG"
+-}}
++{"label": "CORRECT"}
+ ```"""
+ 
+ 
+@@ -141,14 +137,65 @@
+ 
+ 
+ def parse_judge_label(response: str) -> str:
+-    match = re.search(r"\{.*?\}", response, re.DOTALL)
+-    if not match:
+-        raise ValueError("judge response does not contain a JSON object")
+-    payload = json.loads(match.group(0))
+-    label = str(payload.get("label", "")).upper()
+-    if label not in {"CORRECT", "WRONG"}:
+-        raise ValueError("judge label must be CORRECT or WRONG")
+-    return label
++    """Read the judge label from JSON, including common presentation noise.
++
++    The benchmark contract is still a JSON object with one label.  We accept
++    a surrounding explanation/code fence and one extra pair of braces because
++    some compatible models copy the old escaped example literally.  We do not
++    infer a label from arbitrary prose.
++    """
++    text = str(response or "").strip()
++    if not text:
++        raise ValueError("judge response is empty")
++    if text.startswith("```") and text.endswith("```"):
++        lines = text.splitlines()
++        if len(lines) >= 3:
++            text = "\n".join(lines[1:-1]).strip()
++
++    candidates = []
++    for start, char in enumerate(text):
++        if char != "{":
++            continue
++        depth = 0
++        in_string = False
++        escaped = False
++        for end in range(start, len(text)):
++            current = text[end]
++            if in_string:
++                if escaped:
++                    escaped = False
++                elif current == "\\":
++                    escaped = True
++                elif current == '"':
++                    in_string = False
++                continue
++            if current == '"':
++                in_string = True
++            elif current == "{":
++                depth += 1
++            elif current == "}":
++                depth -= 1
++                if depth == 0:
++                    candidates.append(text[start:end + 1])
++                    break
++                if depth < 0:
++                    break
++
++    for candidate in candidates:
++        variants = [candidate]
++        if candidate.startswith("{{") and candidate.endswith("}}"):
++            variants.append(candidate[1:-1])
++        for variant in variants:
++            try:
++                payload = json.loads(variant)
++            except json.JSONDecodeError:
++                continue
++            if not isinstance(payload, dict):
++                continue
++            label = str(payload.get("label", "")).strip().upper()
++            if label in {"CORRECT", "WRONG"}:
++                return label
++    raise ValueError("judge response does not contain a valid CORRECT/WRONG JSON object")
+ 
+ 
+ async def complete(client: httpx.AsyncClient, args: argparse.Namespace, prompt: str, max_tokens: int) -> str:

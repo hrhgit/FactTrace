@@ -6,6 +6,17 @@
 
 **English summary:** FactTrace is an evidence-grounded temporal fact memory system for long conversations. It turns complete sessions into source-linked facts, records how user facts change or conflict over time, and assembles question-specific evidence by ranking facts and restoring related facts from the selected sessions. Its core innovation is treating traceable facts as the unit of long-term memory.
 
+需要运行完整评测测试时，请连同固定版本的官方评测模板一起克隆：
+
+```bash
+git clone --recurse-submodules https://github.com/hrhgit/FactTrace.git
+cd FactTrace
+git -C vendor/aml apply ../../patches/aml-async-file-context.patch
+git -C vendor/aml apply ../../patches/aml-locomo-answer-parser.patch
+```
+
+已有副本可以执行 `git submodule update --init --recursive` 补齐该子模块，再执行上面的两个补丁命令；题库、运行数据库和评测输出仍按需在本地准备，不提交到仓库。
+
 FactTrace 现在只保留完整事实写入和直接查事实这一条正式流程。统一运行入口为 `./.venv/bin/python -m text_memory`，HTTP 和本地评测调用同一个 `CollectionEngine`。
 
 写入：**完整会话 → 提取事实 → 补漏 → 保存事实与来源 → 用户侧关系标注**。

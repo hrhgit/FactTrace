@@ -6,6 +6,8 @@ FactTrace 的核心创新是以带来源的事实作为长期记忆的基本单�
 
 **Competition submission blurb:** FactTrace is a long-conversation memory system built around evidence-grounded temporal facts. It extracts source-linked facts from complete sessions, records how user facts change or conflict over time, and assembles answer material with question-aware semantic, lexical, and time-based retrieval plus same-session fact completion. Its core innovation is treating traceable facts as the unit of long-term memory.
 
+仓库以 Git 子模块固定官方评测模板版本；完整克隆请使用 `git clone --recurse-submodules`，已有副本执行 `git submodule update --init --recursive`，再按[补丁说明](../patches/README.md)应用两个项目补丁。评测题库和运行产物仍在本地准备，不进入提交包。
+
 ## 生成
 
 ```bash

@@ -1,0 +1,3 @@
+[submodule "vendor/aml"]
+	path = vendor/aml
+	url = https://github.com/AML-memory/agent-memory-leaderboard.git
