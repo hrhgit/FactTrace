@@ -1,10 +1,12 @@
-# FactTrace：可追溯时序事实记忆
+# FactTrace
 
-**FactTrace** 是一个面向长会话的事实记忆系统。它把完整会话整理成带来源的具体事实，记录事实之间的时间变化和关系，再根据问题组织出可核对的证据材料。
+**Evidence-grounded temporal fact memory for long conversations.**
 
-项目展示名是 **FactTrace**，运行包名仍是 `text_memory`。完整的项目介绍和核心创新见[项目介绍](docs/project.md)。
+FactTrace turns complete conversations into source-linked facts, records how user facts change or conflict over time, and assembles question-specific evidence from the selected sessions. Its core innovation is treating traceable facts—not isolated text chunks—as the unit of long-term memory.
 
-**English summary:** FactTrace is an evidence-grounded temporal fact memory system for long conversations. It turns complete sessions into source-linked facts, records how user facts change or conflict over time, and assembles question-specific evidence by ranking facts and restoring related facts from the selected sessions. Its core innovation is treating traceable facts as the unit of long-term memory.
+**中文简介：** FactTrace 把完整会话整理成带来源的具体事实，记录事实随时间的变化和关系，再根据问题组织可核对的证据材料。
+
+[Project introduction](docs/project.md) · [Competition submission blurb](docs/submission.md) · [Formal pipeline](docs/collections.md) · [部署说明](deploy/aws/README.md)
 
 需要运行完整评测测试时，请连同固定版本的官方评测模板一起克隆：
 
