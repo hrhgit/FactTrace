@@ -1,0 +1,9 @@
+{
+  "user_id": "demo",
+  "scope_id": "default",
+  "session_id": "session-1",
+  "request_id": "write-1",
+  "messages": [
+    {"role": "user", "speaker": "Alice", "session_date": "2026-10-01", "content": "I keep the copper beacon in the attic because it needs a dry place."}
+  ]
+}

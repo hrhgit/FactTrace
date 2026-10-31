@@ -1,0 +1,301 @@
+diff --git a/data/beam/pipeline.py b/data/beam/pipeline.py
+index a066089..94aaac2 100644
+--- a/data/beam/pipeline.py
++++ b/data/beam/pipeline.py
+@@ -287,16 +287,17 @@ async def answer(args: argparse.Namespace) -> None:
+     items = rows(args.input)
+     output = Path(args.output)
+     done = {item["id"] for item in rows(output)} if output.exists() else set()
+-    async with httpx.AsyncClient(timeout=120) as client, output.open("a", encoding="utf-8") as handle:
+-        for item in (item for item in items if item["id"] not in done):
+-            generated = await call_model(
+-                client,
+-                args,
+-                [{"role": "user", "content": render_answer_prompt(item)}],
+-                args.max_tokens,
+-            )
+-            handle.write(json.dumps({"id": item["id"], "generated_answer": generated}, ensure_ascii=False) + "\n")
+-            handle.flush()
++    async with httpx.AsyncClient(timeout=120) as client:
++        with output.open("a", encoding="utf-8") as handle:
++            for item in (item for item in items if item["id"] not in done):
++                generated = await call_model(
++                    client,
++                    args,
++                    [{"role": "user", "content": render_answer_prompt(item)}],
++                    args.max_tokens,
++                )
++                handle.write(json.dumps({"id": item["id"], "generated_answer": generated}, ensure_ascii=False) + "\n")
++                handle.flush()
+ 
+ 
+ async def snippets_equivalent(
+@@ -398,33 +399,34 @@ async def evaluate(args: argparse.Namespace) -> None:
+         raise SystemExit("input/answer ID mismatch")
+     output = Path(args.output)
+     done = {item["id"] for item in rows(output) if "llm_judge_score" in item} if output.exists() else set()
+-    async with httpx.AsyncClient(timeout=120) as client, output.open("a", encoding="utf-8") as handle:
+-        for ident, item in ((ident, item) for ident, item in items.items() if ident not in done):
+-            rubrics = rubric_items(item)
+-            judge_response = await call_model(
+-                client,
+-                args,
+-                [{"role": "user", "content": render_batch_judge_prompt(text(item["question"]), answers[ident], rubrics)}],
+-                args.judge_max_tokens,
+-                json_mode=True,
+-            )
+-            scores = parse_rubric_scores(judge_response, len(rubrics))
+-            result = {
+-                "id": ident,
+-                "question_type": item.get("question_type", item.get("category")),
+-                "judge_model": args.model,
+-                "rubric_scores": [
+-                    {"rubric": rubric, "score": score["score"], "reason": score["reason"]}
+-                    for rubric, score in zip(rubrics, scores)
+-                ],
+-                "llm_judge_score": sum(score["score"] for score in scores) / len(scores),
+-                "judge_response": judge_response,
+-            }
+-            if result["question_type"] == "event_ordering":
+-                reference, system = await align_with_llm(client, args, rubrics, answers[ident].split("\n"))
+-                result["event_ordering"] = event_ordering_metrics(reference, system)
+-            handle.write(json.dumps(result, ensure_ascii=False) + "\n")
+-            handle.flush()
++    async with httpx.AsyncClient(timeout=120) as client:
++        with output.open("a", encoding="utf-8") as handle:
++            for ident, item in ((ident, item) for ident, item in items.items() if ident not in done):
++                rubrics = rubric_items(item)
++                judge_response = await call_model(
++                    client,
++                    args,
++                    [{"role": "user", "content": render_batch_judge_prompt(text(item["question"]), answers[ident], rubrics)}],
++                    args.judge_max_tokens,
++                    json_mode=True,
++                )
++                scores = parse_rubric_scores(judge_response, len(rubrics))
++                result = {
++                    "id": ident,
++                    "question_type": item.get("question_type", item.get("category")),
++                    "judge_model": args.model,
++                    "rubric_scores": [
++                        {"rubric": rubric, "score": score["score"], "reason": score["reason"]}
++                        for rubric, score in zip(rubrics, scores)
++                    ],
++                    "llm_judge_score": sum(score["score"] for score in scores) / len(scores),
++                    "judge_response": judge_response,
++                }
++                if result["question_type"] == "event_ordering":
++                    reference, system = await align_with_llm(client, args, rubrics, answers[ident].split("\n"))
++                    result["event_ordering"] = event_ordering_metrics(reference, system)
++                handle.write(json.dumps(result, ensure_ascii=False) + "\n")
++                handle.flush()
+ 
+ 
+ def parser() -> argparse.ArgumentParser:
+diff --git a/data/clbench/pipeline.py b/data/clbench/pipeline.py
+index e47e026..5da0180 100644
+--- a/data/clbench/pipeline.py
++++ b/data/clbench/pipeline.py
+@@ -318,15 +318,16 @@ async def answer(args: argparse.Namespace) -> None:
+     model = args.model or os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
+     output_path = Path(args.output)
+     output_path.parent.mkdir(parents=True, exist_ok=True)
+-    async with httpx.AsyncClient(timeout=args.timeout) as client, output_path.open("a", encoding="utf-8") as out:
+-        for index, item in enumerate(records):
+-            ident = row_id(item, index)
+-            if ident in existing:
+-                continue
+-            prompt = build_answer_prompt(item)
+-            model_output = await post_chat(client, base_url=base_url, api_key=api_key, model=model, messages=[{"role": "user", "content": prompt}], temperature=args.temperature)
+-            out.write(json.dumps({"idx": ident, "model_output": model_output, "question": item.get("question", ""), "rubrics": official_rubrics(item), "prompt": prompt, "prompt_source": "prompts.py _CLBENCH_ANSWER_PROMPT_TEMPLATE + memory_search.py CL-Bench retrieval path", "model": model}, ensure_ascii=False) + "\n")
+-            out.flush()
++    async with httpx.AsyncClient(timeout=args.timeout) as client:
++        with output_path.open("a", encoding="utf-8") as out:
++            for index, item in enumerate(records):
++                ident = row_id(item, index)
++                if ident in existing:
++                    continue
++                prompt = build_answer_prompt(item)
++                model_output = await post_chat(client, base_url=base_url, api_key=api_key, model=model, messages=[{"role": "user", "content": prompt}], temperature=args.temperature)
++                out.write(json.dumps({"idx": ident, "model_output": model_output, "question": item.get("question", ""), "rubrics": official_rubrics(item), "prompt": prompt, "prompt_source": "prompts.py _CLBENCH_ANSWER_PROMPT_TEMPLATE + memory_search.py CL-Bench retrieval path", "model": model}, ensure_ascii=False) + "\n")
++                out.flush()
+ 
+ 
+ async def evaluate(args: argparse.Namespace) -> None:
+@@ -340,13 +341,14 @@ async def evaluate(args: argparse.Namespace) -> None:
+     model = args.model or os.environ.get("SILICONFLOW_MODEL", "Qwen/Qwen3-14B")
+     output_path = Path(args.output)
+     output_path.parent.mkdir(parents=True, exist_ok=True)
+-    async with httpx.AsyncClient(timeout=args.timeout) as client, output_path.open("w", encoding="utf-8") as out:
+-        for index, item in enumerate(records):
+-            ident = row_id(item, index)
+-            answer_row = answers.get(ident, {})
+-            result = await evaluate_rubric_clbench(client, base_url=base_url, api_key=api_key, model=model, rubrics=official_rubrics(item), predicted_answer=str(answer_row.get("model_output", answer_row.get("generated_answer", ""))), max_retries=args.max_retries)
+-            out.write(json.dumps({"idx": ident, "question": item.get("question", ""), "judge_model": model, "prompt_source": "rubric_clbench.py evaluate_rubric_clbench", **result}, ensure_ascii=False) + "\n")
+-            out.flush()
++    async with httpx.AsyncClient(timeout=args.timeout) as client:
++        with output_path.open("w", encoding="utf-8") as out:
++            for index, item in enumerate(records):
++                ident = row_id(item, index)
++                answer_row = answers.get(ident, {})
++                result = await evaluate_rubric_clbench(client, base_url=base_url, api_key=api_key, model=model, rubrics=official_rubrics(item), predicted_answer=str(answer_row.get("model_output", answer_row.get("generated_answer", ""))), max_retries=args.max_retries)
++                out.write(json.dumps({"idx": ident, "question": item.get("question", ""), "judge_model": model, "prompt_source": "rubric_clbench.py evaluate_rubric_clbench", **result}, ensure_ascii=False) + "\n")
++                out.flush()
+ 
+ 
+ def main() -> None:
+diff --git a/data/locomo-refined/pipeline.py b/data/locomo-refined/pipeline.py
+index 959c0c1..8b1a175 100644
+--- a/data/locomo-refined/pipeline.py
++++ b/data/locomo-refined/pipeline.py
+@@ -172,11 +172,12 @@ async def answer(args: argparse.Namespace) -> None:
+     items = rows(args.input)
+     output = Path(args.output)
+     done = {item.get("id") for item in rows(output)} if output.exists() else set()
+-    async with httpx.AsyncClient(timeout=120) as client, output.open("a", encoding="utf-8") as handle:
+-        for item in (item for item in items if item["id"] not in done):
+-            generated = await complete(client, args, render_answer_prompt(item), args.max_tokens)
+-            handle.write(json.dumps({"id": item["id"], "generated_answer": generated}, ensure_ascii=False) + "\n")
+-            handle.flush()
++    async with httpx.AsyncClient(timeout=120) as client:
++        with output.open("a", encoding="utf-8") as handle:
++            for item in (item for item in items if item["id"] not in done):
++                generated = await complete(client, args, render_answer_prompt(item), args.max_tokens)
++                handle.write(json.dumps({"id": item["id"], "generated_answer": generated}, ensure_ascii=False) + "\n")
++                handle.flush()
+ 
+ 
+ async def evaluate(args: argparse.Namespace) -> None:
+@@ -188,13 +189,14 @@ async def evaluate(args: argparse.Namespace) -> None:
+     if set(items) != set(answers):
+         raise SystemExit("input/answer ID mismatch")
+     output = Path(args.output)
+-    async with httpx.AsyncClient(timeout=120) as client, output.open("w", encoding="utf-8") as handle:
+-        for ident, item in items.items():
+-            response = await complete(client, args, render_accuracy_prompt(item, answers[ident]), args.max_tokens)
+-            label = parse_judge_label(response)
+-            result = {"id": ident, "label": label, "is_correct": label == "CORRECT", "judge_response": response}
+-            handle.write(json.dumps(result, ensure_ascii=False) + "\n")
+-            handle.flush()
++    async with httpx.AsyncClient(timeout=120) as client:
++        with output.open("w", encoding="utf-8") as handle:
++            for ident, item in items.items():
++                response = await complete(client, args, render_accuracy_prompt(item, answers[ident]), args.max_tokens)
++                label = parse_judge_label(response)
++                result = {"id": ident, "label": label, "is_correct": label == "CORRECT", "judge_response": response}
++                handle.write(json.dumps(result, ensure_ascii=False) + "\n")
++                handle.flush()
+ 
+ 
+ def parser() -> argparse.ArgumentParser:
+diff --git a/data/longmemeval-s/pipeline.py b/data/longmemeval-s/pipeline.py
+index d368c61..8eadb28 100644
+--- a/data/longmemeval-s/pipeline.py
++++ b/data/longmemeval-s/pipeline.py
+@@ -169,11 +169,12 @@ async def answer(args: argparse.Namespace) -> None:
+     items = rows(args.input)
+     output = Path(args.output)
+     done = {item.get("id") for item in rows(output)} if output.exists() else set()
+-    async with httpx.AsyncClient(timeout=120) as client, output.open("a", encoding="utf-8") as handle:
+-        for item in (item for item in items if item["id"] not in done):
+-            generated = await complete(client, args, render_answer_prompt(item), args.max_tokens)
+-            handle.write(json.dumps({"id": item["id"], "generated_answer": generated}, ensure_ascii=False) + "\n")
+-            handle.flush()
++    async with httpx.AsyncClient(timeout=120) as client:
++        with output.open("a", encoding="utf-8") as handle:
++            for item in (item for item in items if item["id"] not in done):
++                generated = await complete(client, args, render_answer_prompt(item), args.max_tokens)
++                handle.write(json.dumps({"id": item["id"], "generated_answer": generated}, ensure_ascii=False) + "\n")
++                handle.flush()
+ 
+ 
+ async def evaluate(args: argparse.Namespace) -> None:
+@@ -185,13 +186,14 @@ async def evaluate(args: argparse.Namespace) -> None:
+     if set(items) != set(answers):
+         raise SystemExit("input/answer ID mismatch")
+     output = Path(args.output)
+-    async with httpx.AsyncClient(timeout=120) as client, output.open("w", encoding="utf-8") as handle:
+-        for ident, item in items.items():
+-            response = await complete(client, args, render_accuracy_prompt(item, answers[ident]), args.max_tokens)
+-            label = parse_judge_label(response)
+-            result = {"id": ident, "label": label, "is_correct": label == "CORRECT", "judge_response": response}
+-            handle.write(json.dumps(result, ensure_ascii=False) + "\n")
+-            handle.flush()
++    async with httpx.AsyncClient(timeout=120) as client:
++        with output.open("w", encoding="utf-8") as handle:
++            for ident, item in items.items():
++                response = await complete(client, args, render_accuracy_prompt(item, answers[ident]), args.max_tokens)
++                label = parse_judge_label(response)
++                result = {"id": ident, "label": label, "is_correct": label == "CORRECT", "judge_response": response}
++                handle.write(json.dumps(result, ensure_ascii=False) + "\n")
++                handle.flush()
+ 
+ 
+ def parser() -> argparse.ArgumentParser:
+diff --git a/data/scriptmem/pipeline.py b/data/scriptmem/pipeline.py
+index c04c26f..b7474f2 100644
+--- a/data/scriptmem/pipeline.py
++++ b/data/scriptmem/pipeline.py
+@@ -304,34 +304,35 @@ async def answer(args: argparse.Namespace) -> None:
+ 
+     output_path = Path(args.output)
+     output_path.parent.mkdir(parents=True, exist_ok=True)
+-    async with httpx.AsyncClient(timeout=args.timeout) as client, output_path.open("a", encoding="utf-8") as out:
+-        for index, item in enumerate(records):
+-            ident = row_id(item, index)
+-            if ident in existing:
+-                continue
+-            generated = await post_chat(
+-                client,
+-                base_url=base_url,
+-                api_key=api_key,
+-                model=model,
+-                prompt=render_answer_prompt(item),
+-                temperature=args.temperature,
+-            )
+-            out.write(
+-                json.dumps(
+-                    {
+-                        "id": ident,
+-                        "dataset": item.get("dataset"),
+-                        "generated_answer": generated,
+-                        "answer_prompt_source": "published dataset answer instructions",
+-                        "eval_source": "ScriptMem src/evaluate.py",
+-                        "model": model,
+-                    },
+-                    ensure_ascii=False,
++    async with httpx.AsyncClient(timeout=args.timeout) as client:
++        with output_path.open("a", encoding="utf-8") as out:
++            for index, item in enumerate(records):
++                ident = row_id(item, index)
++                if ident in existing:
++                    continue
++                generated = await post_chat(
++                    client,
++                    base_url=base_url,
++                    api_key=api_key,
++                    model=model,
++                    prompt=render_answer_prompt(item),
++                    temperature=args.temperature,
+                 )
+-                + "\n"
+-            )
+-            out.flush()
++                out.write(
++                    json.dumps(
++                        {
++                            "id": ident,
++                            "dataset": item.get("dataset"),
++                            "generated_answer": generated,
++                            "answer_prompt_source": "published dataset answer instructions",
++                            "eval_source": "ScriptMem src/evaluate.py",
++                            "model": model,
++                        },
++                        ensure_ascii=False,
++                    )
++                    + "\n"
++                )
++                out.flush()
+ 
+ 
+ def evaluate_official(data_dir: Path, submission_path: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]:

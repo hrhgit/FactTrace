@@ -1,0 +1,25 @@
+[Unit]
+Description=Text memory AML Add/Search service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/text-memory
+EnvironmentFile=/home/ubuntu/.config/text-memory/service.env
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/ubuntu/text-memory/.venv/bin/python -m text_memory serve --env-file /home/ubuntu/.config/text-memory/service.env --database /home/ubuntu/.local/share/text-memory/memory.sqlite --host 127.0.0.1 --port 8766
+Restart=on-failure
+RestartSec=3
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/ubuntu/.local/share/text-memory
+
+[Install]
+WantedBy=multi-user.target

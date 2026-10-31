@@ -1,0 +1,15 @@
+.venv/
+.env
+.env.*
+!.env.example
+__pycache__/
+*.pyc
+.pytest_cache/
+data/public/
+data/local-eval/
+vendor/
+outputs/
+state/
+*.sqlite*
+*.db
+worklog/
